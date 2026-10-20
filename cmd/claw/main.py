@@ -1,80 +1,106 @@
-# cmd/claw/main.py
-# 对应 Go 版: cmd/claw/main.go
-# 第 3 章：mock Provider 感知"是否持有工具"，演示慢思考(规划) + 行动的两阶段循环。
-# 运行方式（在 py-tiny-claw 目录下）: python -m cmd.claw.main
-import logging
-import os
 import sys
 from pathlib import Path
 
-# 直接运行本文件时，工作目录和包导入均使用本章目录。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 把项目根目录加入模块搜索路径
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-os.chdir(PROJECT_ROOT)
 
-from internal.engine.loop import AgentEngine
-from internal.provider.interface import LLMProvider
-from internal.schema.message import (
-    Message,
-    ROLE_ASSISTANT,
-    ToolCall,
-    ToolDefinition,
-    ToolResult,
-)
-from internal.tools.registry import Registry
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y/%m/%d %H:%M:%S")
+from internal.tools.registry import RegistryImpl
+from internal.tools.read_file import ReadFileTool
+from internal.tools.write_file import WriteFileTool
+from internal.tools.edit_file import EditFileTool
+from internal.tools.bash import BashTool
+from internal.schema.message import ToolCall
 
 
-class MockProvider(LLMProvider):
-    def __init__(self):
-        self.turn = 0
+load_dotenv(PROJECT_ROOT / ".env")
+
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+if not API_KEY:
+    raise RuntimeError("未在 .env 中找到 DEEPSEEK_API_KEY")
+
+client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
+
+WORK_DIR = PROJECT_ROOT / "workspace"
+WORK_DIR.mkdir(exist_ok=True)
+
+# 注册四大工具
+registry = RegistryImpl()
+registry.register(ReadFileTool(str(WORK_DIR)))
+registry.register(WriteFileTool(str(WORK_DIR)))
+registry.register(EditFileTool(str(WORK_DIR)))
+registry.register(BashTool(str(WORK_DIR)))
 
 
-    def generate(self, msgs, tools):
-        # TODO://# 没有工具可用 => 处于 Thinking 阶段，只输出规划文本
-
-        self.turn += 1
-        if self.turn == 1:
-            return Message(
-                role=ROLE_ASSISTANT,
-                content="我要执行我刚才计划的步骤了。",
-                tool_calls=[
-                    ToolCall(id="call_123", name="bash", arguments='{"command": "ls -la"}'),
-                ],
-            )
-
-        return Message(
-            role=ROLE_ASSISTANT,
-            content="根据工具返回的结果，我看到了 main.py，任务圆满完成！",
-        )
+def to_openai_tools(defs):
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": d.name,
+                "description": d.description,
+                "parameters": d.input_schema,
+            },
+        }
+        for d in defs
+    ]
 
 
-class MockRegistry(Registry):
-    def get_available_tools(self):
-        return [ToolDefinition(name="bash")]
+TOOLS = to_openai_tools(registry.get_available_tools())
 
-    def execute(self, call: ToolCall) -> ToolResult:
-        return ToolResult(
-            tool_call_id=call.id,
-            output="-rw-r--r--  1 user group  234 Oct 24 10:00 main.py\n",
-            is_error=False,
-        )
+messages = [
+    {"role": "system", "content": "你是本地工作区 Agent，严格按用户任务顺序调用工具。"},
+    {"role": "user", "content": (
+        "按顺序完成：\n"
+        "1. write_file 创建 calc.py：定义 add(a,b) 返回 a+b，__main__ 中 print(add(2,3))\n"
+        "2. bash 执行 python calc.py\n"
+        "3. edit_file 把加法改成乘法（add 返回 a*b）\n"
+        "4. read_file 读 calc.py 确认\n"
+        "5. bash 再执行 python calc.py\n"
+        "最后汇报两次运行输出。"
+    )},
+]
 
+log = []
+for rnd in range(1, 13):
+    print(f"\n===== 第 {rnd} 轮 =====")
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+        temperature=0,
+    )
+    msg = resp.choices[0].message
+    messages.append(msg.model_dump())
 
-def main():
-    work_dir = os.getcwd()
+    if not msg.tool_calls:
+        print("\n[最终回答]")
+        print(msg.content)
+        break
 
-    p = MockProvider()
-    r = MockRegistry()
+    for tc in msg.tool_calls:
+        name = tc.function.name
+        args = tc.function.arguments
+        log.append(name)
+        print(f"🛠 {name}  args={args}")
 
-    eng = AgentEngine(p, r, work_dir, True)
+        result = registry.execute(ToolCall(
+            name=name, arguments=args, tool_call_id=tc.id,
+        ))
+        print(f"   -> {result.content[:300]}")
 
-    try:
-        eng.run("帮我检查当前目录的文件")
-    except Exception as e:
-        sys.exit(f"引擎崩溃: {e}")
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": result.content,
+        })
 
-
-if __name__ == "__main__":
-    main()
+print("\n========== 工具调用统计 ==========")
+print(f"总次数: {len(log)}")
+for i, n in enumerate(log, 1):
+    print(f"  {i}. {n}")
