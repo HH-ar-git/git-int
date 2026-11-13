@@ -1,0 +1,10 @@
+# 课程作业配置文件
+course_name: AI智能体开发基础
+total_students: 120
+deadline: 2026-11-15
+pass_score: 60
+
+database:
+  host: localhost
+  port: 3306
+  name: course_db
